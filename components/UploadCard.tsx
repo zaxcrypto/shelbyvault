@@ -6,6 +6,20 @@ import { useRouter } from "next/navigation";
 
 type Step = "idle" | "uploading" | "done" | "error";
 
+// ─── Network / Currency helpers ───────────────────────────────────────────────
+const SHELBY_COIN_TYPE = "0x1::shelby_usd::ShelbyUSD";
+const APT_COIN_TYPE    = "0x1::aptos_coin::AptosCoin";
+
+// Gas-fee recipient (just needs to be a valid address — using sender itself is fine
+// for a "listing fee" simulation; replace with your treasury address if you have one)
+const GAS_RECIPIENT = "0x1"; // replace with your treasury / marketplace address
+
+/** Returns true when connected to Shelbynet (any non-standard Aptos network) */
+const detectShelby = (networkName: string) =>
+  networkName.includes("shelby") ||
+  (!!networkName &&
+    !["testnet", "mainnet", "devnet", "localnet"].includes(networkName));
+
 export default function UploadCard() {
   const { account, connected, network, signAndSubmitTransaction } = useWallet();
   const router = useRouter();
@@ -21,13 +35,17 @@ export default function UploadCard() {
   const [listed, setListed]     = useState(false);
   const [preview, setPreview]   = useState<string>("");
   const [listTx, setListTx]     = useState("");
+  const [name, setName]         = useState("");
+  const [description, setDescription] = useState("");
   const fileRef = useRef<HTMLInputElement>(null);
 
+  // ── Derived network state ──────────────────────────────────────────────────
   const networkName = network?.name?.toLowerCase() ?? "";
-  const isShelby = networkName.includes("shelby") ||
-    (!!networkName && !["testnet","mainnet","devnet","localnet"].includes(networkName));
-  const currency = isShelby ? "ShelbyUSD" : "APT";
+  const isShelby    = detectShelby(networkName);
+  const currency    = isShelby ? "ShelbyUSD" : "APT";
+  const coinType    = isShelby ? SHELBY_COIN_TYPE : APT_COIN_TYPE;
 
+  // ── File select ────────────────────────────────────────────────────────────
   const onFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const f = e.target.files?.[0] || null;
     setFile(f);
@@ -37,9 +55,12 @@ export default function UploadCard() {
     setListed(false);
     setAssetId("");
     setListTx("");
+    setName(f?.name ?? "");
+    setDescription("");
     if (f) setPreview(URL.createObjectURL(f));
   };
 
+  // ── Upload ─────────────────────────────────────────────────────────────────
   const handleUpload = async () => {
     if (!file || !account) return;
     setError("");
@@ -63,6 +84,7 @@ export default function UploadCard() {
       });
       const saved = await res.json();
       setAssetId(saved.id);
+      setName(saved.name ?? file.name);
       setStep("done");
     } catch (err: any) {
       setStep("error");
@@ -70,36 +92,63 @@ export default function UploadCard() {
     }
   };
 
+  // ── List ───────────────────────────────────────────────────────────────────
   const handleList = async () => {
-    if (!price || !assetId || !supply) return;
+    if (!price || !assetId || !supply || !account) return;
     setListing(true);
+
     try {
+      // 1. Small on-chain gas-fee confirmation using the CORRECT coin for the network
+      //    Amount = 1 octa (smallest unit) — just to trigger wallet signature
       const tx = await signAndSubmitTransaction({
         data: {
-          function: "0x1::coin::transfer",
-          typeArguments: ["0x1::aptos_coin::AptosCoin"],
-          functionArguments: [account!.address.toString(), "1000"],
+          function:          "0x1::coin::transfer",
+          typeArguments:     [coinType],           // ✅ ShelbyUSD on Shelbynet, APT on Testnet
+          functionArguments: [
+            GAS_RECIPIENT,                         // recipient address
+            "1",                                   // 1 octa — tiny gas confirmation fee
+          ],
         },
       });
+
       setListTx(tx.hash);
-      await fetch("/api/marketplace", {
+
+      // 2. Save listing to backend with full metadata
+      const res = await fetch("/api/marketplace", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          id:     assetId,
-          price:  parseFloat(price),
-          supply: parseInt(supply),
-          txHash: tx.hash,
+          id:          assetId,
+          price:       parseFloat(price),
+          supply:      parseInt(supply),
+          txHash:      tx.hash,
+          name:        name || file?.name,
+          description: description,
+          currency:    currency,     // ✅ store which currency was used
+          network:     networkName,  // ✅ store which network
         }),
       });
+
+      if (!res.ok) throw new Error("Failed to save listing");
+
       setListed(true);
       setShowList(false);
     } catch (err: any) {
-      alert("Listing failed: " + (err?.message || "User rejected"));
+      const msg = err?.message || "User rejected";
+      // If wallet is on wrong network, give a clear message
+      if (msg.toLowerCase().includes("coin") || msg.toLowerCase().includes("type")) {
+        alert(
+          `❌ Wrong coin type for this network.\n\nMake sure your wallet is on ${isShelby ? "Shelbynet" : "Aptos Testnet"} and try again.`
+        );
+      } else {
+        alert("Listing failed: " + msg);
+      }
     }
+
     setListing(false);
   };
 
+  // ── Reset ──────────────────────────────────────────────────────────────────
   const handleReset = () => {
     setFile(null);
     setStep("idle");
@@ -111,11 +160,14 @@ export default function UploadCard() {
     setAssetId("");
     setPreview("");
     setListTx("");
+    setName("");
+    setDescription("");
     if (fileRef.current) fileRef.current.value = "";
   };
 
   const isWorking = step === "uploading";
 
+  // ── UI ─────────────────────────────────────────────────────────────────────
   return (
     <>
       <style>{`
@@ -142,6 +194,7 @@ export default function UploadCard() {
           font-size: 14px;
           font-family: 'Space Grotesk', sans-serif;
           outline: none;
+          box-sizing: border-box;
         }
         .glass-input:focus { border-color: rgba(168,85,247,0.5); }
         .glass-input::placeholder { color: rgba(255,255,255,0.2); }
@@ -158,8 +211,30 @@ export default function UploadCard() {
           border: 1.5px dashed rgba(236,72,153,0.3);
           background: rgba(255,255,255,0.025);
           transition: border-color 0.2s, background 0.2s;
+          box-sizing: border-box;
         }
         .upload-drop:hover { border-color: rgba(236,72,153,0.6); background: rgba(236,72,153,0.04); }
+        .network-badge {
+          display: inline-flex;
+          align-items: center;
+          gap: 5px;
+          padding: 3px 8px;
+          border-radius: 20px;
+          font-size: 10px;
+          font-weight: 600;
+          font-family: 'Space Grotesk', sans-serif;
+          letter-spacing: 0.04em;
+        }
+        .network-badge.shelby {
+          background: rgba(168,85,247,0.15);
+          border: 1px solid rgba(168,85,247,0.3);
+          color: rgba(196,130,252,0.9);
+        }
+        .network-badge.aptos {
+          background: rgba(52,211,153,0.1);
+          border: 1px solid rgba(52,211,153,0.25);
+          color: rgba(52,211,153,0.9);
+        }
       `}</style>
 
       <div style={{width:"100%",padding:"32px 32px 28px",display:"flex",flexDirection:"column",alignItems:"center",gap:"18px"}}>
@@ -167,9 +242,16 @@ export default function UploadCard() {
         {/* Header */}
         <div style={{textAlign:"center"}}>
           <h1 style={{fontFamily:"'Syne',sans-serif",fontSize:"2rem",fontWeight:800,background:"linear-gradient(135deg,rgba(255,255,255,0.9),rgba(196,130,252,0.8))",WebkitBackgroundClip:"text",WebkitTextFillColor:"transparent",backgroundClip:"text",margin:0,letterSpacing:"-0.02em"}}>ShelbyVault</h1>
-          <p style={{fontSize:"12px",color:"rgba(255,255,255,0.3)",margin:"4px 0 0",fontFamily:"'Space Grotesk',sans-serif"}}>
-            {connected ? `Connected · ${isShelby?"Shelby":"Aptos"} Testnet` : "Connect wallet to upload"}
-          </p>
+          <div style={{display:"flex",alignItems:"center",justifyContent:"center",gap:"6px",marginTop:"6px"}}>
+            {connected ? (
+              <span className={`network-badge ${isShelby ? "shelby" : "aptos"}`}>
+                <span style={{width:"5px",height:"5px",borderRadius:"50%",background:isShelby?"rgba(196,130,252,0.9)":"rgba(52,211,153,0.9)",display:"inline-block"}}/>
+                {isShelby ? "Shelbynet · ShelbyUSD" : "Aptos Testnet · APT"}
+              </span>
+            ) : (
+              <p style={{fontSize:"12px",color:"rgba(255,255,255,0.3)",margin:0,fontFamily:"'Space Grotesk',sans-serif"}}>Connect wallet to upload</p>
+            )}
+          </div>
         </div>
 
         {/* Not connected */}
@@ -250,6 +332,41 @@ export default function UploadCard() {
             {/* List form */}
             {!listed && showList && (
               <div style={{display:"flex",flexDirection:"column",gap:"10px"}}>
+
+                {/* Network indicator inside form */}
+                <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"8px 12px",borderRadius:"10px",background:"rgba(255,255,255,0.03)",border:"1px solid rgba(255,255,255,0.07)"}}>
+                  <span style={{fontSize:"11px",color:"rgba(255,255,255,0.35)",fontFamily:"'Space Grotesk',sans-serif"}}>Listing currency</span>
+                  <span className={`network-badge ${isShelby ? "shelby" : "aptos"}`}>
+                    {currency}
+                  </span>
+                </div>
+
+                {/* Name */}
+                <div>
+                  <label style={{fontSize:"10px",color:"rgba(255,255,255,0.35)",fontFamily:"'Space Grotesk',sans-serif",letterSpacing:"0.06em",textTransform:"uppercase",display:"block",marginBottom:"5px"}}>Name</label>
+                  <input
+                    type="text"
+                    value={name}
+                    onChange={e => setName(e.target.value)}
+                    placeholder="My Asset"
+                    className="glass-input"
+                  />
+                </div>
+
+                {/* Description */}
+                <div>
+                  <label style={{fontSize:"10px",color:"rgba(255,255,255,0.35)",fontFamily:"'Space Grotesk',sans-serif",letterSpacing:"0.06em",textTransform:"uppercase",display:"block",marginBottom:"5px"}}>Description <span style={{opacity:0.5}}>(optional)</span></label>
+                  <textarea
+                    value={description}
+                    onChange={e => setDescription(e.target.value)}
+                    placeholder="Describe your asset..."
+                    rows={2}
+                    className="glass-input"
+                    style={{resize:"none"}}
+                  />
+                </div>
+
+                {/* Price + Supply */}
                 <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"8px"}}>
                   <div>
                     <label style={{fontSize:"10px",color:"rgba(255,255,255,0.35)",fontFamily:"'Space Grotesk',sans-serif",letterSpacing:"0.06em",textTransform:"uppercase",display:"block",marginBottom:"5px"}}>Price ({currency})</label>
@@ -260,15 +377,16 @@ export default function UploadCard() {
                     <input type="number" min="1" step="1" value={supply} onChange={e=>setSupply(e.target.value)} placeholder="10" className="glass-input"/>
                   </div>
                 </div>
+
                 <button onClick={handleList} disabled={listing||!price||!supply} className="shimmer-btn" style={{width:"100%",padding:"12px",borderRadius:"14px",fontSize:"13px"}}>
                   {listing ? (
                     <span style={{display:"flex",alignItems:"center",justifyContent:"center",gap:"7px"}}>
                       <span className="spin-anim" style={{width:"12px",height:"12px",border:"2px solid rgba(255,255,255,0.5)",borderTopColor:"transparent",borderRadius:"50%",display:"inline-block"}}/>
-                      Confirm in Wallet...
+                      Confirming...
                     </span>
-                  ) : "List on Marketplace"}
+                  ) : `List on Marketplace (${currency})`}
                 </button>
-                <p style={{fontSize:"10px",color:"rgba(255,255,255,0.2)",textAlign:"center",margin:0,fontFamily:"'Space Grotesk',sans-serif"}}>Small gas fee to confirm on-chain</p>
+                <p style={{fontSize:"10px",color:"rgba(255,255,255,0.2)",textAlign:"center",margin:0,fontFamily:"'Space Grotesk',sans-serif"}}>A small gas fee confirms listing on-chain</p>
                 <button onClick={()=>setShowList(false)} style={{background:"none",border:"none",color:"rgba(255,255,255,0.28)",fontSize:"11px",cursor:"pointer",fontFamily:"'Space Grotesk',sans-serif",padding:"2px"}}>Cancel</button>
               </div>
             )}
@@ -282,12 +400,14 @@ export default function UploadCard() {
                   </button>
                 )}
                 <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"8px"}}>
-                  <button onClick={handleReset} style={{padding:"11px",borderRadius:"12px",background:"rgba(255,255,255,0.04)",border:"1px solid rgba(255,255,255,0.1)",color:"rgba(255,255,255,0.6)",fontSize:"12px",fontWeight:600,cursor:"pointer",fontFamily:"'Space Grotesk',sans-serif",transition:"border-color 0.2s"}}
+                  <button onClick={handleReset}
+                    style={{padding:"11px",borderRadius:"12px",background:"rgba(255,255,255,0.04)",border:"1px solid rgba(255,255,255,0.1)",color:"rgba(255,255,255,0.6)",fontSize:"12px",fontWeight:600,cursor:"pointer",fontFamily:"'Space Grotesk',sans-serif",transition:"border-color 0.2s"}}
                     onMouseOver={e=>(e.currentTarget.style.borderColor="rgba(255,255,255,0.22)")}
                     onMouseOut={e=>(e.currentTarget.style.borderColor="rgba(255,255,255,0.1)")}>
                     + Upload Another
                   </button>
-                  <button onClick={()=>router.push("/vault")} style={{padding:"11px",borderRadius:"12px",background:"rgba(168,85,247,0.1)",border:"1px solid rgba(168,85,247,0.25)",color:"rgba(196,130,252,0.9)",fontSize:"12px",fontWeight:600,cursor:"pointer",fontFamily:"'Space Grotesk',sans-serif",transition:"border-color 0.2s"}}
+                  <button onClick={()=>router.push("/vault")}
+                    style={{padding:"11px",borderRadius:"12px",background:"rgba(168,85,247,0.1)",border:"1px solid rgba(168,85,247,0.25)",color:"rgba(196,130,252,0.9)",fontSize:"12px",fontWeight:600,cursor:"pointer",fontFamily:"'Space Grotesk',sans-serif",transition:"border-color 0.2s"}}
                     onMouseOver={e=>(e.currentTarget.style.borderColor="rgba(168,85,247,0.5)")}
                     onMouseOut={e=>(e.currentTarget.style.borderColor="rgba(168,85,247,0.25)")}>
                     Go to Vault →
